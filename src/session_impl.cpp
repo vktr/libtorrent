@@ -2592,41 +2592,15 @@ void apply_deprecated_dht_settings(settings_pack& sett, bdecode_node const& s)
 		, transport const ssl)
 	{
 		TORRENT_ASSERT(!m_abort);
-		std::shared_ptr<socket_type> c;
-		tcp::socket* str = nullptr;
-
-#ifdef TORRENT_USE_OPENSSL
-		if (ssl == transport::ssl)
-		{
-			// accept connections initializing the SSL connection to
-			// use the generic m_ssl_ctx context. However, since it has
-			// the servername callback set on it, we will switch away from
-			// this context into a specific torrent once we start handshaking
-			c = std::make_shared<socket_type>(ssl_stream<tcp::socket>(m_io_context, m_ssl_ctx));
-			str = &boost::get<ssl_stream<tcp::socket>>(*c).next_layer();
-		}
-		else
-#endif
-		{
-			c = std::make_shared<socket_type>(tcp::socket(m_io_context));
-			str = boost::get<tcp::socket>(c.get());
-		}
-
-		ADD_OUTSTANDING_ASYNC("session_impl::on_accept_connection");
-
-#ifdef TORRENT_USE_OPENSSL
-		TORRENT_ASSERT((ssl == transport::ssl) == is_ssl(*c));
-#endif
 
 		std::weak_ptr<tcp::acceptor> ls(listener);
 		m_stats_counters.inc_stats_counter(counters::num_outstanding_accept);
-		listener->async_accept(*str, [this, c, ls, ssl] (error_code const& ec)
-			{ return wrap(&session_impl::on_accept_connection, c, ls, ec, ssl); });
+		listener->async_accept([this, ls, ssl] (error_code const& ec, true_tcp_socket s)
+			{ return wrap(&session_impl::on_accept_connection, std::move(s), ec, ls, ssl); });
 	}
 
-	void session_impl::on_accept_connection(std::shared_ptr<socket_type> const& s
-		, std::weak_ptr<tcp::acceptor> listen_socket, error_code const& e
-		, transport const ssl)
+	void session_impl::on_accept_connection(true_tcp_socket s, error_code const& e
+		, std::weak_ptr<tcp::acceptor> listen_socket, transport const ssl)
 	{
 		COMPLETE_ASYNC("session_impl::on_accept_connection");
 		m_stats_counters.inc_stats_counter(counters::on_accept_counter);
@@ -2718,22 +2692,45 @@ void apply_deprecated_dht_settings(settings_pack& sett, bdecode_node const& s)
 		if (listen != m_listen_sockets.end())
 			(*listen)->incoming_connection = true;
 
+		std::shared_ptr<socket_type> c;
+
 #ifdef TORRENT_USE_OPENSSL
 		if (ssl == transport::ssl)
 		{
-			TORRENT_ASSERT(is_ssl(*s));
-
-			// for SSL connections, incoming_connection() is called
-			// after the handshake is done
-			ADD_OUTSTANDING_ASYNC("session_impl::ssl_handshake");
-			boost::get<ssl_stream<tcp::socket>>(*s).async_accept_handshake(
-				std::bind(&session_impl::ssl_handshake, this, _1, s));
-			m_incoming_sockets.insert(s);
+			// accept connections initializing the SSL connection to
+			// use the generic m_ssl_ctx context. However, since it has
+			// the servername callback set on it, we will switch away from
+			// this context into a specific torrent once we start handshaking
+			c = std::make_shared<socket_type>(ssl_stream<tcp::socket>(tcp::socket(std::move(s)), m_ssl_ctx));
 		}
 		else
 #endif
 		{
-			incoming_connection(s);
+			c = std::make_shared<socket_type>(tcp::socket(std::move(s)));
+		}
+
+		ADD_OUTSTANDING_ASYNC("session_impl::on_accept_connection");
+
+#ifdef TORRENT_USE_OPENSSL
+		TORRENT_ASSERT((ssl == transport::ssl) == is_ssl(*c));
+#endif
+
+#ifdef TORRENT_USE_OPENSSL
+		if (ssl == transport::ssl)
+		{
+			TORRENT_ASSERT(is_ssl(*c));
+
+			// for SSL connections, incoming_connection() is called
+			// after the handshake is done
+			ADD_OUTSTANDING_ASYNC("session_impl::ssl_handshake");
+			boost::get<ssl_stream<tcp::socket>>(*c).async_accept_handshake(
+				std::bind(&session_impl::ssl_handshake, this, _1, std::move(c)));
+			m_incoming_sockets.insert(c);
+		}
+		else
+#endif
+		{
+			incoming_connection(std::move(c));
 		}
 	}
 
